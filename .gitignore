@@ -1,0 +1,15 @@
+# зависимости (ставятся заново через: bun install)
+node_modules/
+package-lock.json
+
+# конфигурация с API-ключами — не публиковать
+mychecker.config.json
+.mycheckerrc
+.env
+
+# служебное
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,26 @@
+{
+  "apiKeys": {
+    "etherscan": "",
+    "bscscan": "",
+    "polygonscan": "",
+    "arbiscan": "",
+    "optimism": "",
+    "basescan": "",
+    "solscan": "",
+    "trongrid": "",
+    "blockchair": "",
+    "debank": ""
+  },
+  "customExplorers": {
+    "ethereum": "https://etherscan.io/address/{address}"
+  },
+  "additionalCheckers": [
+    {
+      "name": "My Custom Explorer",
+      "urlTemplate": "https://example.com/address/{address}",
+      "types": ["evm"],
+      "networks": ["ethereum"]
+    }
+  ],
+  "disabledCheckers": []
+}
