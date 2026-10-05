@@ -31,24 +31,35 @@ mychecker --help          # или: bun mychecker.ts --help
 
 Либо одной командой: `bash install.sh`
 
-## Загрузка на GitHub (первый раз)
+## Загрузка на GitHub
 
-Создайте на GitHub **пустой** репозиторий `MYChecker` (без README и .gitignore),
-затем на машине, где установлен git:
+**Первый раз.** Создайте на GitHub **пустой** репозиторий `MYChecker` (без
+README и .gitignore), затем на машине, где установлен git:
 
 ```bash
 cd MYChecker
 git init
 git add .
-git commit -m "MYChecker 1.0.0 — мультичейн-чекер, 36 сетей"
+git commit -m "MYChecker 1.1.0"
 git branch -M main
 git remote add origin https://github.com/YOUR_GITHUB_USERNAME/MYChecker.git
 git push -u origin main
 ```
 
-`.gitignore` уже исключает `node_modules/` и файлы конфигурации с API-ключами,
-так что ключи в репозиторий не попадут. `bun.lock` наоборот включён — он
-обеспечивает одинаковые версии зависимостей на сервере.
+**Обновление** уже загруженного репозитория:
+
+```bash
+cd MYChecker
+git add -A
+git commit -m "Etherscan API v2, устойчивость к лимитам API"
+git push
+```
+
+`.gitignore` исключает `node_modules/` и конфиги с API-ключами — ключи в
+репозиторий не попадут. `bun.lock` наоборот включён: он фиксирует версии
+зависимостей, чтобы на сервере встало то же самое. `.gitattributes` следит,
+чтобы `install.sh` всегда выгружался с переводами строк LF — иначе он не
+запустится на Linux.
 
 ## Использование
 
@@ -71,6 +82,10 @@ mychecker "ваша мнемоника" --accounts 5 --json
 
 # приватный ключ вместо мнемоники
 mychecker <hex_или_WIF_или_base58> --check
+
+# версия и справка
+mychecker --version
+mychecker --help
 ```
 
 Если команда не в PATH — запускайте как `bun mychecker.ts ...` из папки репозитория.
@@ -79,10 +94,10 @@ mychecker <hex_или_WIF_или_base58> --check
 
 | Семейство | Сети | Источник баланса |
 |---|---|---|
-| EVM, 22 шт. | ethereum, bsc, polygon, arbitrum, optimism, avalanche, fantom, base, zksync, linea, scroll, mantle, celo, gnosis, blast, opbnb, polygonzkevm, cronos, aurora, zora, ink, bera | публичные RPC (`eth_getBalance`) |
+| EVM, 22 шт. | ethereum, bsc, polygon, arbitrum, optimism, avalanche, fantom, base, zksync, linea, scroll, mantle, celo, gnosis, blast, opbnb, polygonzkevm, cronos, aurora, zora, ink, bera | публичные RPC (`eth_getBalance`), резерв thirdweb, ключ Etherscan (v2) |
 | Solana | solana | api.mainnet-beta.solana.com |
 | Tron | tron | trongrid |
-| Биткоин-семейство | bitcoin, litecoin, dogecoin | mempool.space; BlockCypher |
+| Биткоин-семейство | bitcoin, litecoin, dogecoin | mempool.space / blockstream.info / blockchain.info; BlockCypher |
 | Cosmos | cosmos | cosmos-rest.publicnode.com |
 | Aptos | aptos | aptoslabs fullnode |
 | Sui | sui | sui-rpc.publicnode.com |
@@ -95,8 +110,9 @@ mychecker <hex_или_WIF_или_base58> --check
 
 ## Ключи API (необязательно)
 
-Публичные эндпоинты работают без ключей, но имеют лимиты. Для интенсивного
-использования:
+Публичные эндпоинты работают без ключей, но имеют лимиты. Ключ стоит завести
+ради одного: **Etherscan покрывает часть EVM-сетей и снимает нагрузку с
+публичных RPC**.
 
 ```bash
 mychecker --init-config          # создаст mychecker.config.json
@@ -105,9 +121,62 @@ mychecker --init-config          # создаст mychecker.config.json
 Файл ищется в: `./mychecker.config.json`, `./.mycheckerrc`, `~/.mychecker.json`,
 `~/.config/mychecker/config.json` (или путь через `--config`).
 
-Поддерживаются ключи: `etherscan`, `bscscan`, `polygonscan`, `arbiscan`,
-`optimism`, `basescan`, `solscan`, `trongrid`, `blockchair`, `debank`.
-С ключом Blockchair Биткоин проверяется через него, без ключа — через mempool.space.
+**Etherscan (бесплатный ключ).** Инструмент использует единый **API v2**
+(`api.etherscan.io/v2/api?chainid=…`), потому что старые эндпоинты вида
+`api.bscscan.com/api` Etherscan отключил. Один ключ `etherscan` работает для
+всех сетей, входящих в тариф; на момент проверки бесплатный тариф покрывал
+**8 сетей из 22**: ethereum, polygon, arbitrum, linea, mantle, blast, opbnb,
+berachain. Остальные 14 идут через публичные RPC и резерв thirdweb — то есть
+без ключа вы тоже ничего не теряете, ключ просто добавляет надёжности.
+
+Лимиты бесплатного тарифа: 3 запроса/сек, до 100 000 запросов в сутки.
+
+```json
+{ "apiKeys": { "etherscan": "ВАШ_КЛЮЧ" } }
+```
+
+Ключи `bscscan`, `polygonscan`, `arbiscan`, `optimism`, `basescan`, `solscan`,
+`trongrid`, `blockchair`, `debank` тоже читаются — они используются, только
+если общего ключа etherscan нет.
+
+Про **Blockchair** (Биткоин): бесплатного ключа у них нет, тарифы начинаются
+от 25 000 запросов в сутки и они платные. Без ключа лимит — 1440 запросов в
+сутки на IP, поэтому Биткоин по умолчанию проверяется через mempool.space,
+а Blockchair подключается только при наличии ключа.
+
+## Лимиты и баны IP
+
+Публичные API ограничивают частоту запросов, а некоторые (Blockchair) вообще
+банят общие IP без ключа. Инструмент защищается сам:
+
+- **Троттлинг по хостам** — не чаще одного запроса к одному хосту за 400 мс.
+  Обычный прогон по 36 сетям почти не тормозит (хосты разные), а развёртка
+  десятков адресов одной сети растягивается и не попадает под лимит.
+- **Повторы с задержкой** — при 429, 403, 430 и 5xx запрос повторяется до 3 раз
+  с экспоненциальной паузой; заголовок `Retry-After` учитывается.
+- **Перебор источников** — у Bitcoin три независимых API (mempool.space,
+  blockstream.info, blockchain.info), у Litecoin и Dogecoin по два, у Cosmos и
+  Sui по три. Если первый отдал лимит или недоступен, берётся следующий.
+- **Автоматический резерв для EVM** — `https://<chainId>.rpc.thirdweb.com`
+  подставляется последним для всех 22 EVM-сетей (проверено на каждой).
+
+Настройки через переменные окружения:
+
+```bash
+MYCHECKER_HOST_DELAY_MS=800 mychecker "фраза" --check   # медленнее, если ловите лимиты
+MYCHECKER_RETRIES=5 mychecker "фраза" --check
+```
+
+Свои RPC задаются в конфиге и пробуются первыми:
+
+```json
+{
+  "customRpcs": {
+    "ethereum": ["https://my-private-node.example.com"],
+    "polygon": ["https://polygon-rpc.com"]
+  }
+}
+```
 
 ## Безопасность
 
@@ -151,7 +220,17 @@ Cardano, Solana, Tron, Bitcoin, Litecoin, Dogecoin, Cosmos, Near, XRP, Stellar).
 **Добавлено 12 EVM-сетей:** scroll, mantle, celo, gnosis, blast, opbnb,
 polygonzkevm, cronos, aurora, zora, ink, bera. Также заменён нерабочий RPC Polygon.
 
+**Устойчивость к лимитам и банам IP:** троттлинг по хостам, повторы с
+экспоненциальной паузой и перебор независимых источников на каждую сеть.
+Раньше развёртка 40 биткоин-адресов упиралась в HTTP 429 на девяти из них —
+теперь проходит полностью. Подробности в разделе «Лимиты и баны IP».
+
+**EVM-сканеры переведены на Etherscan API v2:** старые эндпоинты
+(`api.bscscan.com/api` и подобные) Etherscan отключил, из-за чего ключ
+API не работал вообще — запрос молча падал и инструмент уходил на RPC.
+Теперь один ключ `etherscan` обслуживает все сети, входящие в тариф.
+
 ## Лицензия
 
 MIT — см. [LICENSE](LICENSE). Исходный проект: `cryptochecker` (автор asim),
-лицензия MIT.
+лицензия MIT. Полная история правок — в [CHANGELOG.md](CHANGELOG.md).

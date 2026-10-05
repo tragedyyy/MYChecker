@@ -24,6 +24,7 @@ export interface Network {
   type: ChainType;
   explorer: string;
   rpc?: string;
+  rpcs?: string[];
   chainId?: number;
   symbol: string;
   balanceApi?: (address: string) => string;
@@ -91,6 +92,7 @@ export interface ApiKeyConfig {
 
 export interface UserConfig {
   customExplorers?: Record<string, string>;
+  customRpcs?: Record<string, string[]>;
   additionalCheckers?: CheckerService[];
   disabledCheckers?: string[];
   apiKeys?: ApiKeyConfig;

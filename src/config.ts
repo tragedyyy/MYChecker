@@ -100,6 +100,7 @@ export function generateSampleConfig(): string {
         networks: ["ethereum"],
       },
     ],
+    customRpcs: {},
     disabledCheckers: [],
   };
   return JSON.stringify(sample, null, 2);

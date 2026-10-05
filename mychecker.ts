@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// CRYPTOCHECKER - Multi-Chain Address & Balance Tool
+// MYCHECKER - Multi-Chain Address & Balance Tool
 // ═══════════════════════════════════════════════════════════════════════════════
 
-import { writeFileSync } from "fs";
+import { readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 
 // Import from src modules
@@ -71,6 +71,15 @@ import {
 } from "./src/chains/other";
 
 import { checkBalances } from "./src/balance";
+
+// Version is read from package.json so it can never drift from the manifest
+const VERSION: string = (() => {
+  try {
+    return JSON.parse(readFileSync(join(import.meta.dir, "package.json"), "utf-8")).version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ADDRESS DERIVATION
@@ -671,6 +680,8 @@ function printBalances(balances: BalanceResult[]) {
 
 function printUsage() {
   console.log(`
+${colors.bold}MYChecker ${VERSION}${colors.reset}
+
 ${colors.bold}Usage:${colors.reset}
   mychecker <private_key_or_mnemonic> [options]
 
@@ -709,6 +720,7 @@ ${colors.bold}Options:${colors.reset}
   --config <path>     Path to custom config file
   --init-config       Generate sample config file
   --insecure          Disable SSL verification (for VPN/proxy environments)
+  --version           Show version
   --help              Show this help
 
 ${colors.bold}Examples:${colors.reset}
@@ -759,6 +771,11 @@ ${colors.bold}Supported Networks:${colors.reset}
 
 async function main() {
   const args = process.argv.slice(2);
+
+  if (args.includes("--version") || args.includes("-v")) {
+    console.log(`mychecker ${VERSION}`);
+    process.exit(0);
+  }
 
   if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
     printHeader();

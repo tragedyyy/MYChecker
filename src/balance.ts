@@ -11,7 +11,7 @@ import { u8aConcat } from "@polkadot/util";
 // UTILITIES
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function fetchWithTimeout(url: string, options: RequestInit, timeout = 10000): Promise<Response> {
+async function rawFetchOnce(url: string, options: RequestInit, timeout: number): Promise<Response> {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeout);
   
@@ -42,38 +42,138 @@ export function formatBalance(balance: bigint, decimals: number): string {
 // EVM BALANCE
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const SCANNER_APIS: Record<string, { url: string; keyName: keyof ApiKeyConfig }> = {
-  ethereum: { url: "https://api.etherscan.io/api", keyName: "etherscan" },
-  bsc: { url: "https://api.bscscan.com/api", keyName: "bscscan" },
-  polygon: { url: "https://api.polygonscan.com/api", keyName: "polygonscan" },
-  arbitrum: { url: "https://api.arbiscan.io/api", keyName: "arbiscan" },
-  optimism: { url: "https://api-optimistic.etherscan.io/api", keyName: "optimism" },
-  base: { url: "https://api.basescan.org/api", keyName: "basescan" },
-};
-
+// Etherscan V2 - a single endpoint for every chain included in the plan.
+// The old per-explorer endpoints (api.bscscan.com/api and alike) are V1 and
+// Etherscan shut them down, so one etherscan key now serves any chain with a chainId.
 export async function getEVMBalanceWithApi(
-  address: string, 
-  networkKey: string, 
+  address: string,
+  networkKey: string,
   config: UserConfig
 ): Promise<{ balance: bigint; source: string } | null> {
-  const scanner = SCANNER_APIS[networkKey];
-  const apiKey = scanner ? config.apiKeys?.[scanner.keyName] : null;
-  
-  if (scanner && apiKey) {
-    try {
-      const url = `${scanner.url}?module=account&action=balance&address=${address}&tag=latest&apikey=${apiKey}`;
-      const response = await fetch(url);
-      const data = await response.json();
-      if (data.status === "1") {
-        return { balance: BigInt(data.result), source: `${networkKey}scan API` };
-      }
-    } catch {
-      // Fall through to RPC
-    }
+  const chainId = (NETWORKS as any)[networkKey]?.chainId;
+  // The etherscan key covers the whole family; per-scanner keys are still read
+  // for compatibility and used only when the shared key is absent.
+  const apiKey =
+    config.apiKeys?.etherscan ?? config.apiKeys?.[networkKey as keyof ApiKeyConfig] ?? null;
+  if (!chainId || !apiKey) return null;
+
+  try {
+    const url =
+      `https://api.etherscan.io/v2/api?chainid=${chainId}` +
+      `&module=account&action=balance&address=${address}&tag=latest&apikey=${apiKey}`;
+    const response = await fetchWithTimeout(url, { method: "GET" });
+    if (!response.ok) return null;
+    const data = await response.json();
+    // status !== "1" means the chain is not in the plan - fall back to the RPC
+    if (data.status !== "1") return null;
+    return { balance: BigInt(data.result), source: "etherscan v2" };
+  } catch {
+    return null; // any failure here still leaves the RPC path available
   }
-  return null;
 }
 
+// --- Network layer: per-host throttling and retries so public APIs do not ban the IP ---
+// Tunable via environment variables:
+//   MYCHECKER_HOST_DELAY_MS - pause between requests to the same host (default 400)
+//   MYCHECKER_RETRIES       - retry attempts on rate limit or failure (default 3)
+const HOST_DELAY_MS = Number(process.env.MYCHECKER_HOST_DELAY_MS ?? 400);
+const MAX_RETRIES = Number(process.env.MYCHECKER_RETRIES ?? 3);
+const USER_AGENT = "MYChecker/1.0 (multi-chain balance checker)";
+
+const lastRequestAt = new Map<string, number>();
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// 429 = rate limit, 403 = usually bot protection, 430 = Blockchair ban, 5xx = service failure
+const isRetryableStatus = (status: number): boolean =>
+  status === 429 || status === 403 || status === 430 || status >= 500;
+
+// At most one request per host per HOST_DELAY_MS: request bursts are what cause bans
+async function throttleHost(host: string): Promise<void> {
+  const previous = lastRequestAt.get(host) ?? 0;
+  const wait = previous + HOST_DELAY_MS - Date.now();
+  if (wait > 0) await sleep(wait);
+  lastRequestAt.set(host, Date.now());
+}
+
+function retryDelay(attempt: number, retryAfterHeader: string | null): number {
+  const after = Number(retryAfterHeader);
+  if (Number.isFinite(after) && after > 0) return Math.min(60000, after * 1000);
+  return Math.min(30000, 1000 * 2 ** attempt) + Math.floor(Math.random() * 500);
+}
+
+function withHeaders(options: RequestInit): RequestInit {
+  return {
+    ...options,
+    headers: {
+      "User-Agent": USER_AGENT,
+      Accept: "application/json",
+      ...((options.headers as Record<string, string> | undefined) ?? {}),
+    },
+  };
+}
+
+async function fetchWithTimeout(url: string, options: RequestInit, timeout = 15000): Promise<Response> {
+  const host = new URL(url).host;
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    await throttleHost(host);
+    try {
+      const response = await rawFetchOnce(url, withHeaders(options), timeout);
+      if (isRetryableStatus(response.status) && attempt < MAX_RETRIES) {
+        await sleep(retryDelay(attempt, response.headers.get("retry-after")));
+        continue;
+      }
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (attempt < MAX_RETRIES) {
+        await sleep(retryDelay(attempt, null));
+        continue;
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("Request failed");
+}
+
+// Try sources in order: if one is rate limited or down, move to the next
+async function trySources<T>(sources: Array<() => Promise<T>>, label: string): Promise<T> {
+  const errors: string[] = [];
+  for (const source of sources) {
+    try {
+      return await source();
+    } catch (error: any) {
+      errors.push(error?.message ?? String(error));
+    }
+  }
+  throw new Error(`${label}: all sources failed (${errors.join("; ").slice(0, 180)})`);
+}
+
+// RPC list: user config first, then the configured endpoint, then built-in fallbacks.
+// https://<chainId>.rpc.thirdweb.com works for every EVM chain tested here, so it is
+// always appended as a last-resort fallback.
+function evmRpcs(networkConfig: any, networkKey: string | undefined, config: UserConfig): string[] {
+  const custom = networkKey ? config.customRpcs?.[networkKey] ?? [] : [];
+  const builtin = networkConfig?.rpcs ?? [];
+  const primary = networkConfig?.rpc ? [networkConfig.rpc] : [];
+  const thirdweb = networkConfig?.chainId
+    ? [`https://${networkConfig.chainId}.rpc.thirdweb.com`]
+    : [];
+  return [...new Set([...custom, ...primary, ...builtin, ...thirdweb])];
+}
+
+function decimalToSmallest(value: string, decimals: number): bigint {
+  const [whole, frac = ""] = String(value).trim().split(".");
+  const padded = (frac + "0".repeat(decimals)).slice(0, decimals);
+  return BigInt(whole || "0") * 10n ** BigInt(decimals) + BigInt(padded || "0");
+}
+
+export async function getEVMBalanceAny(rpcs: string[], address: string): Promise<bigint> {
+  return trySources(
+    rpcs.map((rpc) => () => getEVMBalance(rpc, address)),
+    "EVM"
+  );
+}
 export async function getEVMBalance(rpc: string, address: string): Promise<bigint> {
   const response = await fetchWithTimeout(rpc, {
     method: "POST",
@@ -109,7 +209,7 @@ export async function getDeBankPortfolio(address: string, apiKey: string): Promi
   chains: { chain: string; usdValue: number }[];
 } | null> {
   try {
-    const response = await fetch(
+    const response = await fetchWithTimeout(
       `https://pro-openapi.debank.com/v1/user/total_balance?id=${address}`,
       { headers: { "AccessKey": apiKey } }
     );
@@ -194,7 +294,7 @@ export async function getSolanaMultipleBalances(addresses: string[]): Promise<Ma
 
 export async function getSolscanBalance(address: string, apiKey: string): Promise<bigint | null> {
   try {
-    const response = await fetch(
+    const response = await fetchWithTimeout(
       `https://pro-api.solscan.io/v2.0/account/${address}`,
       { headers: { "token": apiKey } }
     );
@@ -212,7 +312,7 @@ export async function getSolscanBalance(address: string, apiKey: string): Promis
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export async function getTronBalance(address: string): Promise<bigint> {
-  const response = await fetch(`https://api.trongrid.io/v1/accounts/${address}`);
+  const response = await fetchWithTimeout(`https://api.trongrid.io/v1/accounts/${address}`, { method: "GET" });
   if (!response.ok) {
     throw new Error(`Tron API error: HTTP ${response.status}`);
   }
@@ -227,92 +327,111 @@ export async function getTronBalance(address: string): Promise<bigint> {
 // BITCOIN FAMILY BALANCE
 // ═══════════════════════════════════════════════════════════════════════════════
 
-export async function getBitcoinBalance(address: string, apiKey?: string): Promise<bigint> {
-  // With an API key Blockchair is used; without one it blacklists shared IPs,
-  // so mempool.space (the explorer already configured for Bitcoin) is the default.
-  if (apiKey) {
-    const response = await fetchWithTimeout(
-      `https://api.blockchair.com/bitcoin/dashboards/address/${address}?key=${apiKey}`,
-      { method: "GET" }
-    );
-    if (!response.ok) {
-      throw new Error(`Blockchair API error: HTTP ${response.status}`);
-    }
-    const data = await response.json();
-    if (data.context?.error) {
-      throw new Error(`Blockchair API error: ${data.context.error}`);
-    }
-    return BigInt(data.data?.[address]?.address?.balance || 0);
-  }
-
-  const response = await fetchWithTimeout(`https://mempool.space/api/address/${address}`, {
-    method: "GET",
-  });
-  if (response.status === 404) {
-    return 0n; // address has no on-chain history yet
-  }
-  if (!response.ok) {
-    throw new Error(`mempool.space API error: HTTP ${response.status}`);
-  }
+// Esplora-compatible source (mempool.space, blockstream.info): funded minus spent
+// Esplora-compatible source (mempool.space, blockstream.info): funded minus spent
+async function esploraBalance(base: string, address: string): Promise<bigint> {
+  const response = await fetchWithTimeout(`${base}/api/address/${address}`, { method: "GET" });
+  if (response.status === 404) return 0n; // address has no on-chain history yet
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
   const data = await response.json();
-  if (!data.chain_stats) {
-    throw new Error("mempool.space API error: unexpected response");
-  }
+  if (!data.chain_stats) throw new Error("unexpected response");
   return BigInt(data.chain_stats.funded_txo_sum || 0) - BigInt(data.chain_stats.spent_txo_sum || 0);
 }
-export async function getLitecoinBalance(address: string): Promise<bigint> {
-  // Blockchair blacklists shared IPs without a key, so BlockCypher is used instead.
+
+async function blockchainInfoBalance(address: string): Promise<bigint> {
+  const response = await fetchWithTimeout(`https://blockchain.info/balance?active=${address}`, { method: "GET" });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const data = await response.json();
+  const record = data?.[address];
+  if (!record) throw new Error("unexpected response");
+  return BigInt(record.final_balance || 0);
+}
+
+export async function getBitcoinBalance(address: string, apiKey?: string): Promise<bigint> {
+  // Blockchair only works with a key (without one it bans shared IPs),
+  // so the sources below are tried in order until one succeeds.
+  const sources: Array<() => Promise<bigint>> = [];
+  if (apiKey) {
+    sources.push(async () => {
+      const response = await fetchWithTimeout(
+        `https://api.blockchair.com/bitcoin/dashboards/address/${address}?key=${apiKey}`,
+        { method: "GET" }
+      );
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      if (data.context?.error) throw new Error(data.context.error);
+      return BigInt(data.data?.[address]?.address?.balance || 0);
+    });
+  }
+  sources.push(() => esploraBalance("https://mempool.space", address));
+  sources.push(() => esploraBalance("https://blockstream.info", address));
+  sources.push(() => blockchainInfoBalance(address));
+  return trySources(sources, "Bitcoin");
+}
+
+async function blockCypherBalance(chain: "ltc" | "doge", address: string): Promise<bigint> {
   const response = await fetchWithTimeout(
-    `https://api.blockcypher.com/v1/ltc/main/addrs/${address}/balance`,
+    `https://api.blockcypher.com/v1/${chain}/main/addrs/${address}/balance`,
     { method: "GET" }
   );
-  if (response.status === 404) {
-    return 0n;
-  }
-  if (!response.ok) {
-    throw new Error(`BlockCypher API error: HTTP ${response.status}`);
-  }
+  if (response.status === 404) return 0n;
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
   const data = await response.json();
-  if (typeof data.balance !== "number") {
-    throw new Error("BlockCypher API error: unexpected response");
-  }
+  if (typeof data.balance !== "number") throw new Error("unexpected response");
   return BigInt(data.balance);
 }
-export async function getDogecoinBalance(address: string): Promise<bigint> {
-  const response = await fetchWithTimeout(
-    `https://api.blockcypher.com/v1/doge/main/addrs/${address}/balance`,
-    { method: "GET" }
+
+export async function getLitecoinBalance(address: string): Promise<bigint> {
+  return trySources(
+    [
+      () => blockCypherBalance("ltc", address),
+      () => esploraBalance("https://litecoinspace.org", address),
+    ],
+    "Litecoin"
   );
-  if (response.status === 404) {
-    return 0n;
-  }
-  if (!response.ok) {
-    throw new Error(`BlockCypher API error: HTTP ${response.status}`);
-  }
-  const data = await response.json();
-  if (typeof data.balance !== "number") {
-    throw new Error("BlockCypher API error: unexpected response");
-  }
-  return BigInt(data.balance);
+}
+
+export async function getDogecoinBalance(address: string): Promise<bigint> {
+  return trySources(
+    [
+      () => blockCypherBalance("doge", address),
+      async () => {
+        const response = await fetchWithTimeout(
+          `https://dogechain.info/api/v1/address/balance/${address}`,
+          { method: "GET" }
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (typeof data.balance !== "string") throw new Error("unexpected response");
+        return decimalToSmallest(data.balance, 8);
+      },
+    ],
+    "Dogecoin"
+  );
 }
 // ═══════════════════════════════════════════════════════════════════════════════
 // OTHER CHAIN BALANCES
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export async function getCosmosBalance(address: string): Promise<bigint> {
-  const response = await fetchWithTimeout(
-    `https://cosmos-rest.publicnode.com/cosmos/bank/v1beta1/balances/${address}`,
-    { method: "GET" }
+  const lcds = [
+    NETWORKS.cosmos.rpc!,
+    "https://rest.cosmos.directory/cosmoshub",
+    "https://cosmos-api.polkachu.com",
+  ];
+  return trySources(
+    lcds.map((base) => async () => {
+      const response = await fetchWithTimeout(`${base}/cosmos/bank/v1beta1/balances/${address}`, {
+        method: "GET",
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      if (!Array.isArray(data.balances)) throw new Error("unexpected response");
+      const uatom = data.balances.find((b: any) => b.denom === "uatom");
+      return BigInt(uatom?.amount || 0);
+    }),
+    "Cosmos"
   );
-  if (!response.ok) {
-    throw new Error(`Cosmos API error: HTTP ${response.status}`);
-  }
-  const data = await response.json();
-  if (!Array.isArray(data.balances)) {
-    throw new Error("Cosmos API error: unexpected response");
-  }
-  const uatom = data.balances.find((b: any) => b.denom === "uatom");
-  return BigInt(uatom?.amount || 0);
 }
 
 export async function getAptosBalance(address: string): Promise<bigint> {
@@ -332,24 +451,31 @@ export async function getAptosBalance(address: string): Promise<bigint> {
 }
 
 export async function getSuiBalance(address: string): Promise<bigint> {
-  const response = await fetchWithTimeout(NETWORKS.sui.rpc!, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      method: "suix_getBalance",
-      params: [address, "0x2::sui::SUI"],
-      id: 1,
+  const rpcs = [
+    NETWORKS.sui.rpc!,
+    "https://sui.publicnode.com",
+    "https://sui-mainnet-endpoint.blockvision.org",
+  ];
+  return trySources(
+    rpcs.map((rpc) => async () => {
+      const response = await fetchWithTimeout(rpc, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "suix_getBalance",
+          params: [address, "0x2::sui::SUI"],
+          id: 1,
+        }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      if (data.error) throw new Error(data.error.message);
+      if (!data.result) throw new Error("empty response");
+      return BigInt(data.result.totalBalance ?? 0);
     }),
-  });
-  const data = await response.json();
-  if (data.error) {
-    throw new Error(`Sui RPC error: ${data.error.message}`);
-  }
-  if (!data.result) {
-    throw new Error(`Sui RPC returned no result: ${JSON.stringify(data).slice(0, 120)}`);
-  }
-  return BigInt(data.result.totalBalance ?? 0);
+    "Sui"
+  );
 }
 
 export async function getNearBalance(address: string): Promise<bigint> {
@@ -553,7 +679,8 @@ export async function checkBalances(
         const networkKey = networkEntry?.[0];
         const networkConfig = networkEntry?.[1];
         
-        if (!networkConfig?.rpc) continue;
+        const rpcList = evmRpcs(networkConfig, networkKey, config);
+        if (rpcList.length === 0) continue;
 
         const cacheKey = `${addr.network}:${addr.address}`;
         if (isChecked("evm", cacheKey)) continue;
@@ -579,10 +706,10 @@ export async function checkBalances(
           if (apiResult) {
             balance = apiResult.balance;
           } else {
-            balance = await getEVMBalance(networkConfig.rpc, addr.address);
+            balance = await getEVMBalanceAny(rpcList, addr.address);
           }
         } else {
-          balance = await getEVMBalance(networkConfig.rpc, addr.address);
+          balance = await getEVMBalanceAny(rpcList, addr.address);
         }
         decimals = 18;
       } else if (addr.type === "solana") {

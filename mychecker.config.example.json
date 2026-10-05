@@ -1,15 +1,14 @@
 {
   "apiKeys": {
     "etherscan": "",
-    "bscscan": "",
-    "polygonscan": "",
-    "arbiscan": "",
-    "optimism": "",
-    "basescan": "",
     "solscan": "",
     "trongrid": "",
     "blockchair": "",
     "debank": ""
+  },
+  "customRpcs": {
+    "ethereum": [],
+    "polygon": []
   },
   "customExplorers": {
     "ethereum": "https://etherscan.io/address/{address}"

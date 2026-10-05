@@ -86,7 +86,7 @@ export const NETWORKS: Record<string, Network> = {
     chainId: 59144,
     symbol: "ETH",
   },
-  // EVM Networks (добавлено вручную, RPC проверены)
+  // EVM networks added manually (RPC endpoints verified)
   scroll: {
     name: "Scroll",
     type: "evm",

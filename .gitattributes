@@ -1,0 +1,13 @@
+# Единые переводы строк: скрипты и код должны попадать в репозиторий с LF,
+# иначе install.sh не запустится на Linux.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.ts   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
